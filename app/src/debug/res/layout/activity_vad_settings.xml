@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/vad_settings_scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:padding="20dp">
+
+    <LinearLayout
+        android:id="@+id/vad_settings_root"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/vad_settings_title"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="VAD Settings"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/vadAlwaysOnSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Always-on listening" />
+
+        <LinearLayout
+            android:id="@+id/vadManualRow"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/vadListenToggleBtn"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Start listening" />
+
+            <View
+                android:id="@+id/vadListeningIndicator"
+                android:layout_width="12dp"
+                android:layout_height="12dp"
+                android:layout_marginStart="12dp"
+                android:background="@android:color/darker_gray" />
+
+            <TextView
+                android:id="@+id/vadListeningLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="Listening: off" />
+        </LinearLayout>
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/vadAutoEndSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Automatic end detect" />
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/vadShowPopupSwitch"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Show transcript popup" />
+
+        <TextView
+            android:id="@+id/vadModeLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Aggressiveness" />
+
+        <Spinner
+            android:id="@+id/vadModeSpinner"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+
+        <TextView
+            android:id="@+id/vadMinSpeechLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Minimum speech duration (ms)" />
+
+        <EditText
+            android:id="@+id/vadMinSpeechEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="e.g. 200"
+            android:inputType="number" />
+
+        <TextView
+            android:id="@+id/vadMinAmplitudeLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Min amplitude gate" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal">
+
+            <CheckBox
+                android:id="@+id/vadAmpGateCheckbox"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Enable" />
+
+            <EditText
+                android:id="@+id/vadMinAmplitudeEdit"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:hint="Min amplitude (0-32767)"
+                android:inputType="number" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/vadPeakMinLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Peak min (600-1200)" />
+
+        <EditText
+            android:id="@+id/vadPeakMinEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="e.g. 800"
+            android:inputType="number" />
+
+        <TextView
+            android:id="@+id/vadRmsMinLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="RMS min dBFS (e.g. -42)" />
+
+        <EditText
+            android:id="@+id/vadRmsMinEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="-42"
+            android:inputType="numberSigned|numberDecimal" />
+
+        <TextView
+            android:id="@+id/vadNoiseMarginLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Noise margin dB (e.g. 8)" />
+
+        <EditText
+            android:id="@+id/vadNoiseMarginEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="8"
+            android:inputType="numberSigned|numberDecimal" />
+
+        <TextView
+            android:id="@+id/vadHangoverLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Hangover (N_ON / N_OFF)" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/vadNOnEdit"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="e.g. 5"
+                android:inputType="number" />
+
+            <EditText
+                android:id="@+id/vadNOffEdit"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:hint="e.g. 75"
+                android:inputType="number" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/vadHangoverHint"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="N_ON = start after X speech frames; N_OFF = stop after X non-speech frames" />
+
+        <TextView
+            android:id="@+id/vadMinUtterLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Min utterance (ms)" />
+
+        <EditText
+            android:id="@+id/vadMinUtterEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="e.g. 700"
+            android:inputType="number" />
+
+        <TextView
+            android:id="@+id/vadMinSpeechRatioLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Min speech ratio (0-1)" />
+
+        <EditText
+            android:id="@+id/vadMinSpeechRatioEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="0.35"
+            android:inputType="numberDecimal" />
+
+        <TextView
+            android:id="@+id/vadMergeGapLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Merge gap (ms)" />
+
+        <EditText
+            android:id="@+id/vadMergeGapEdit"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="250"
+            android:inputType="number" />
+
+        <TextView
+            android:id="@+id/vadLevelLabel"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Level: 0" />
+
+        <ProgressBar
+            android:id="@+id/vadLevelBar"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:max="32767"
+            android:progress="0" />
+
+        <Button
+            android:id="@+id/vadApplyBtn"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Apply VAD Config" />
+
+    </LinearLayout>
+</ScrollView>

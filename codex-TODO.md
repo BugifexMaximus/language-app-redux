@@ -1,3 +1,4 @@
 # Codex TODO
 
-- Add a debug panel (debug-only manifest + DebugPanelActivity + debug panel layout) for testing.
+- Verify manual listen UX on emulator/physical device.
+- Consider replacing the banner activity with an in-app overlay to avoid pausing the settings screen.

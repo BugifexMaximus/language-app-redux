@@ -29,6 +29,16 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".TranscriptPopupActivity"
+            android:exported="false"
+            android:theme="@style/Theme.MyApplication.TranscriptPopup" />
+
+        <activity
+            android:name=".StatusBannerActivity"
+            android:exported="false"
+            android:theme="@style/Theme.MyApplication.StatusBanner" />
+
         <service
             android:name=".MicrophoneForegroundService"
             android:exported="false"

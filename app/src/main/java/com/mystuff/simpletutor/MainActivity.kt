@@ -36,6 +36,14 @@ class MainActivity : AppCompatActivity() {
             startActivity(intent)
         }
 
+        findViewById<Button?>(R.id.debug_open_vad)?.setOnClickListener {
+            val intent = Intent().setClassName(
+                this,
+                "com.mystuff.simpletutor.DebugVadSettingsActivity"
+            )
+            startActivity(intent)
+        }
+
         ensureNotificationPermissionAndStartService()
     }
 

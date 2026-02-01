@@ -6,6 +6,11 @@
             android:name=".DebugPanelActivity"
             android:exported="false"
             android:label="Debug Panel" />
+
+        <activity
+            android:name=".DebugVadSettingsActivity"
+            android:exported="false"
+            android:label="VAD Settings" />
     </application>
 
 </manifest>
