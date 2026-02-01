@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.MediaPlayer
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
@@ -43,9 +44,20 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 class MicrophoneForegroundService : Service() {
     private enum class Action { OPEN_DEBUG, GO_HOME, NONE }
+    private enum class PipelineRoute(val value: String) {
+        TEST_STT("test_stt"),
+        TUTOR("tutor");
+
+        companion object {
+            fun fromValue(value: String?): PipelineRoute =
+                values().firstOrNull { it.value == value } ?: TEST_STT
+        }
+    }
     private val tag = "MicrophoneForegroundService"
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -57,6 +69,11 @@ class MicrophoneForegroundService : Service() {
     private var lastActionAtMs: Long = 0L
     private var audioRecord: AudioRecord? = null
     private lateinit var currentConfig: VadUserConfig
+    private var tutorUserId: String = "alexei-1"
+    private var tutorLanguageLabel: String = "Japanese"
+    private var tutorLanguageCode: String = "ja-JP"
+    private var tutorMode: String = "chat"
+    private var pipelineRoute: PipelineRoute = PipelineRoute.TEST_STT
     private var lastConfigCheckMs: Long = 0L
     private var lastLevelBroadcastMs: Long = 0L
     private var lastFrameLogMs: Long = 0L
@@ -79,6 +96,7 @@ class MicrophoneForegroundService : Service() {
                 stopAudioRecord()
             }
             broadcastListeningStatus()
+            broadcastPipelineState(if (isListeningEnabled()) "Listening" else "Offline")
             configDirty = true
         }
     }
@@ -87,6 +105,7 @@ class MicrophoneForegroundService : Service() {
         super.onCreate()
         createNotificationChannel()
         currentConfig = VadConfigStore.load(this)
+        pipelineRoute = loadPipelineRoute()
         Log.d(tag, "Service created: alwaysOn=${currentConfig.alwaysOn}, manual=${currentConfig.manualListening}")
         ContextCompat.registerReceiver(
             this,
@@ -95,6 +114,7 @@ class MicrophoneForegroundService : Service() {
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
         broadcastListeningStatus()
+        broadcastPipelineState(if (isListeningEnabled()) "Listening" else "Offline")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -108,6 +128,19 @@ class MicrophoneForegroundService : Service() {
                     }
                     setManualListening(enabled)
                 }
+            }
+            ACTION_SET_PIPELINE_ROUTE -> {
+                val route = PipelineRoute.fromValue(intent.getStringExtra(EXTRA_ROUTE))
+                pipelineRoute = route
+                savePipelineRoute(route)
+                Log.d(tag, "Pipeline route: ${route.value}")
+            }
+            ACTION_SET_TUTOR_CONTEXT -> {
+                tutorUserId = intent.getStringExtra(EXTRA_USER_ID) ?: tutorUserId
+                tutorLanguageLabel = intent.getStringExtra(EXTRA_LANG_LABEL) ?: tutorLanguageLabel
+                tutorLanguageCode = intent.getStringExtra(EXTRA_LANG_CODE) ?: tutorLanguageCode
+                tutorMode = intent.getStringExtra(EXTRA_MODE) ?: tutorMode
+                Log.d(tag, "Tutor context: user=$tutorUserId, lang=$tutorLanguageLabel ($tutorLanguageCode), mode=$tutorMode")
             }
         }
         startListeningLoop()
@@ -193,19 +226,34 @@ class MicrophoneForegroundService : Service() {
                 val wavFile = File(cacheDir, "utt_${System.currentTimeMillis()}.wav")
                 WavWriter.writePcm16Mono(wavFile, bytes, VadConfig.sampleRateHz)
                 val durationMs = (bytes.size / 2.0 / VadConfig.sampleRateHz * 1000).toInt()
-                showStatusBanner("Sending snippet (${durationMs}ms, ${bytes.size} bytes)...")
+                if (pipelineRoute == PipelineRoute.TEST_STT) {
+                    showStatusBanner("Sending snippet (${durationMs}ms, ${bytes.size} bytes)...")
+                }
+                broadcastPipelineState("Thinking")
                 val transcript = transcribe(wavFile)
                 if (transcript.isNotBlank() && transcript != lastTranscript) {
                     lastTranscript = transcript
-                    if (configSnapshot.showTranscriptPopup) {
+                    if (pipelineRoute == PipelineRoute.TEST_STT && configSnapshot.showTranscriptPopup) {
                         showTranscriptPopup(transcript)
+                    }
+                    if (pipelineRoute == PipelineRoute.TUTOR) {
+                        broadcastChatMessage("user", transcript)
+                        val response = generateTutorReply(transcript)
+                        if (response.isNotBlank()) {
+                            broadcastChatMessage("tutor", response)
+                            broadcastPipelineState("Speaking")
+                            playTts(response)
+                        }
                     }
                     val action = classify(transcript)
                     if (action != Action.NONE && shouldFireAction()) {
                         handleAction(action)
                     }
                 }
-                hideStatusBanner()
+                broadcastPipelineState(if (isListeningEnabled()) "Listening" else "Offline")
+                if (pipelineRoute == PipelineRoute.TEST_STT) {
+                    hideStatusBanner()
+                }
             }
 
             fun handleUtterance(bytes: ByteArray) {
@@ -399,6 +447,91 @@ class MicrophoneForegroundService : Service() {
         }
     }
 
+    private fun generateTutorReply(text: String): String {
+        val prompt = escapeJson(buildTutorPrompt(text))
+        val payload = """
+            {
+              "model": "$TUTOR_MODEL",
+              "input": "$prompt"
+            }
+        """.trimIndent()
+
+        val req = Request.Builder()
+            .url("https://api.openai.com/v1/responses")
+            .post(payload.toRequestBody(json))
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Authorization", authHeader())
+            .build()
+
+        return try {
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return ""
+                val body = resp.body?.string().orEmpty()
+                extractOutputText(body).trim()
+            }
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun buildTutorPrompt(text: String): String {
+        return "You are a friendly language tutor. The learner speaks English and is practicing $tutorLanguageLabel. Reply in $tutorLanguageLabel with short, natural responses, and include brief English help only if needed. User said: $text"
+    }
+
+    private suspend fun playTts(text: String) {
+        val payload = """
+            {
+              "model": "$TTS_MODEL",
+              "voice": "$TTS_VOICE",
+              "input": "${escapeJson(text)}"
+            }
+        """.trimIndent()
+
+        val req = Request.Builder()
+            .url("https://api.openai.com/v1/audio/speech")
+            .post(payload.toRequestBody(json))
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Authorization", authHeader())
+            .build()
+
+        val audioBytes = try {
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return
+                resp.body?.bytes() ?: return
+            }
+        } catch (_: Exception) {
+            return
+        }
+
+        val outFile = File(cacheDir, "tts_${System.currentTimeMillis()}.mp3")
+        outFile.writeBytes(audioBytes)
+        playAudioFile(outFile)
+    }
+
+    private suspend fun playAudioFile(file: File) {
+        if (!file.exists()) return
+        suspendCoroutine<Unit> { cont ->
+            val player = MediaPlayer()
+            player.setOnPreparedListener { it.start() }
+            player.setOnCompletionListener {
+                it.release()
+                cont.resume(Unit)
+            }
+            player.setOnErrorListener { mp, _, _ ->
+                mp.release()
+                cont.resume(Unit)
+                true
+            }
+            try {
+                player.setDataSource(file.absolutePath)
+                player.prepareAsync()
+            } catch (e: Exception) {
+                player.release()
+                cont.resume(Unit)
+            }
+        }
+    }
+
     private fun classify(text: String): Action {
         val payload = """
             {
@@ -526,13 +659,41 @@ class MicrophoneForegroundService : Service() {
             stopAudioRecord()
         }
         broadcastListeningStatus()
+        broadcastPipelineState(if (isListeningEnabled()) "Listening" else "Offline")
     }
 
     private fun broadcastListeningStatus() {
         val intent = Intent(ACTION_LISTENING_STATUS)
             .setPackage(packageName)
             .putExtra("listening", isListeningEnabled())
+            .putExtra("alwaysOn", currentConfig.alwaysOn)
+            .putExtra("manualListening", currentConfig.manualListening)
         sendBroadcast(intent)
+    }
+
+    private fun broadcastChatMessage(role: String, text: String) {
+        val intent = Intent(ACTION_CHAT_MESSAGE)
+            .setPackage(packageName)
+            .putExtra(EXTRA_ROLE, role)
+            .putExtra(EXTRA_TEXT, text)
+        sendBroadcast(intent)
+    }
+
+    private fun broadcastPipelineState(state: String) {
+        val intent = Intent(ACTION_PIPELINE_STATE)
+            .setPackage(packageName)
+            .putExtra(EXTRA_STATE, state)
+        sendBroadcast(intent)
+    }
+
+    private fun loadPipelineRoute(): PipelineRoute {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return PipelineRoute.fromValue(prefs.getString(PREF_PIPELINE_ROUTE, PipelineRoute.TEST_STT.value))
+    }
+
+    private fun savePipelineRoute(route: PipelineRoute) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(PREF_PIPELINE_ROUTE, route.value).apply()
     }
 
     private fun maxAbs(samples: ShortArray, count: Int): Int {
@@ -602,6 +763,9 @@ class MicrophoneForegroundService : Service() {
         private const val CHANNEL_ID = "microphone_service"
         private const val NOTIFICATION_ID = 100
         private const val STT_MODEL = "gpt-4o-transcribe"
+        private const val TUTOR_MODEL = "gpt-5.2"
+        private const val TTS_MODEL = "gpt-4o-mini-tts"
+        private const val TTS_VOICE = "alloy"
         private const val CLASSIFIER_MODEL = "gpt-5.2"
         private const val ACTION_COOLDOWN_MS = 4000L
         private const val FRAME_MS = 20
@@ -610,8 +774,22 @@ class MicrophoneForegroundService : Service() {
         const val ACTION_LEVEL = "com.mystuff.simpletutor.VAD_LEVEL"
         const val ACTION_CONFIG_CHANGED = "com.mystuff.simpletutor.VAD_CONFIG_CHANGED"
         const val ACTION_LISTENING_STATUS = "com.mystuff.simpletutor.VAD_LISTENING_STATUS"
+        const val ACTION_PIPELINE_STATE = "com.mystuff.simpletutor.PIPELINE_STATE"
+        const val ACTION_CHAT_MESSAGE = "com.mystuff.simpletutor.CHAT_MESSAGE"
         const val ACTION_SET_MANUAL_LISTEN = "com.mystuff.simpletutor.SET_MANUAL_LISTEN"
+        const val ACTION_SET_PIPELINE_ROUTE = "com.mystuff.simpletutor.SET_PIPELINE_ROUTE"
+        const val ACTION_SET_TUTOR_CONTEXT = "com.mystuff.simpletutor.SET_TUTOR_CONTEXT"
         const val EXTRA_ENABLED = "enabled"
+        const val EXTRA_STATE = "state"
+        const val EXTRA_ROLE = "role"
+        const val EXTRA_TEXT = "text"
+        const val EXTRA_ROUTE = "route"
+        const val EXTRA_USER_ID = "userId"
+        const val EXTRA_LANG_LABEL = "langLabel"
+        const val EXTRA_LANG_CODE = "langCode"
+        const val EXTRA_MODE = "mode"
         private const val NOISE_ALPHA = 0.1f
+        private const val PREFS_NAME = "pipeline_prefs"
+        private const val PREF_PIPELINE_ROUTE = "pipeline_route"
     }
 }

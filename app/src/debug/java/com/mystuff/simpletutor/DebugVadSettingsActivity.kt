@@ -52,6 +52,7 @@ class DebugVadSettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_vad_settings)
+        disablePipeline()
 
         val root = findViewById<View>(R.id.vad_settings_root)
         val scroll = findViewById<View>(R.id.vad_settings_scroll)
@@ -191,6 +192,7 @@ class DebugVadSettingsActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
+        disablePipeline()
         ContextCompat.registerReceiver(
             this,
             levelReceiver,
@@ -221,5 +223,13 @@ class DebugVadSettingsActivity : AppCompatActivity() {
         val color = if (listening) android.graphics.Color.GREEN else android.graphics.Color.DKGRAY
         vadListeningIndicator.setBackgroundColor(color)
         vadListeningLabel.text = if (listening) "Listening: on" else "Listening: off"
+    }
+
+    private fun disablePipeline() {
+        val intent = android.content.Intent(this, MicrophoneForegroundService::class.java).apply {
+            action = MicrophoneForegroundService.ACTION_SET_PIPELINE_ROUTE
+            putExtra(MicrophoneForegroundService.EXTRA_ROUTE, "test_stt")
+        }
+        ContextCompat.startForegroundService(this, intent)
     }
 }
