@@ -46,6 +46,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlinx.coroutines.CancellableContinuation
@@ -74,7 +75,12 @@ class MicrophoneForegroundService : Service() {
     private val tag = "MicrophoneForegroundService"
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .build()
     private val json = "application/json".toMediaType()
     private val octetStream = "application/octet-stream".toMediaType()
     private var loopJob: Job? = null
@@ -93,6 +99,7 @@ class MicrophoneForegroundService : Service() {
     @Volatile private var currentCall: Call? = null
     @Volatile private var ttsContinuation: CancellableContinuation<Unit>? = null
     private var pipelineRoute: PipelineRoute = PipelineRoute.TEST_STT
+    @Volatile private var manualListenSource: String = LISTEN_SOURCE_NONE
     private var lastConfigCheckMs: Long = 0L
     private var lastLevelBroadcastMs: Long = 0L
     private var lastFrameLogMs: Long = 0L
@@ -109,6 +116,12 @@ class MicrophoneForegroundService : Service() {
             if (intent?.action != ACTION_CONFIG_CHANGED) return
             val beforeManual = currentConfig.manualListening
             currentConfig = VadConfigStore.load(this@MicrophoneForegroundService)
+            if (!currentConfig.manualListening) {
+                manualListenSource = LISTEN_SOURCE_NONE
+            } else if (!beforeManual && currentConfig.manualListening) {
+                manualListenSource = LISTEN_SOURCE_EXTERNAL
+            }
+            saveListenSource(manualListenSource)
             Log.d(tag, "Config changed: alwaysOn=${currentConfig.alwaysOn}, manual=${currentConfig.manualListening}, autoEnd=${currentConfig.autoEndDetect}")
             if (beforeManual && !currentConfig.manualListening) {
                 pendingManualStop = true
@@ -128,6 +141,13 @@ class MicrophoneForegroundService : Service() {
         learningRepo = LearningRepository(this)
         currentConfig = VadConfigStore.load(this)
         pipelineRoute = loadPipelineRoute()
+        manualListenSource = loadListenSource()
+        if (!currentConfig.manualListening) {
+            manualListenSource = LISTEN_SOURCE_NONE
+        } else if (manualListenSource == LISTEN_SOURCE_NONE) {
+            manualListenSource = LISTEN_SOURCE_EXTERNAL
+        }
+        saveListenSource(manualListenSource)
         loadTutorContext()
         Log.d(tag, "Service created: alwaysOn=${currentConfig.alwaysOn}, manual=${currentConfig.manualListening}")
         ContextCompat.registerReceiver(
@@ -145,6 +165,17 @@ class MicrophoneForegroundService : Service() {
         when (intent?.action) {
             ACTION_SET_MANUAL_LISTEN -> {
                 val enabled = intent.getBooleanExtra(EXTRA_ENABLED, false)
+                val source = intent.getStringExtra(EXTRA_LISTEN_SOURCE)
+                manualListenSource = if (enabled) {
+                    if (source == LISTEN_SOURCE_CHAT) {
+                        LISTEN_SOURCE_CHAT
+                    } else {
+                        LISTEN_SOURCE_EXTERNAL
+                    }
+                } else {
+                    LISTEN_SOURCE_NONE
+                }
+                saveListenSource(manualListenSource)
                 if (currentConfig.manualListening != enabled) {
                     if (!enabled) {
                         pendingManualStop = true
@@ -254,7 +285,7 @@ class MicrophoneForegroundService : Service() {
             val frameBuffer = ShortArray(VadConfig.frameSizeSamples)
             val byteBuffer = ByteArray(VadConfig.frameSizeSamples * 2)
 
-            suspend fun sendUtterance(bytes: ByteArray, configSnapshot: VadUserConfig) {
+            suspend fun sendUtterance(bytes: ByteArray, configSnapshot: VadUserConfig, listenSource: String) {
                 val localToken = interruptToken.get()
                 val wavFile = File(cacheDir, "utt_${System.currentTimeMillis()}.wav")
                 WavWriter.writePcm16Mono(wavFile, bytes, VadConfig.sampleRateHz)
@@ -291,10 +322,20 @@ class MicrophoneForegroundService : Service() {
                             broadcastPipelineState("Speaking")
                             playTts(response)
                         }
+                    } else {
+                        Log.d(tag, "Skipping LLM: pipeline route ${pipelineRoute.value}")
                     }
-                    val action = classify(transcript)
-                    if (action != Action.NONE && shouldFireAction()) {
-                        handleAction(action)
+                    if (shouldClassify(configSnapshot, listenSource)) {
+                        val action = classify(transcript)
+                        if (action != Action.NONE && shouldFireAction()) {
+                            handleAction(action)
+                        }
+                    }
+                } else {
+                    if (transcript.isBlank()) {
+                        Log.d(tag, "Skipping LLM: empty transcript")
+                    } else {
+                        Log.d(tag, "Skipping LLM: duplicate transcript")
                     }
                 }
                 broadcastPipelineState(if (isListeningEnabled()) "Listening" else "Offline")
@@ -305,9 +346,10 @@ class MicrophoneForegroundService : Service() {
 
             fun handleUtterance(bytes: ByteArray) {
                 val configSnapshot = currentConfig
+                val listenSourceSnapshot = manualListenSource
                 serviceScope.launch {
                     sendMutex.withLock {
-                        sendUtterance(bytes, configSnapshot)
+                        sendUtterance(bytes, configSnapshot, listenSourceSnapshot)
                     }
                 }
             }
@@ -472,10 +514,19 @@ class MicrophoneForegroundService : Service() {
     private fun transcribe(file: File): String {
         if (!file.exists() || file.length() == 0L) return ""
         Log.d(tag, "Transcribing ${file.name} (${file.length()} bytes)")
-        val sttPrompt = "English or $tutorLanguageLabel"
+        val model = loadDebugPref(KEY_STT_MODEL) ?: STT_MODEL
+        val language = loadDebugPref(KEY_STT_LANGUAGE)
+        val extraPrompt = loadDebugPref(KEY_STT_PROMPT)?.trim().orEmpty()
+        val basePrompt = "English or $tutorLanguageLabel"
+        val sttPrompt = if (extraPrompt.isNotBlank()) "$basePrompt. $extraPrompt" else basePrompt
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
-            .addFormDataPart("model", STT_MODEL)
+            .addFormDataPart("model", model)
+            .apply {
+                if (!language.isNullOrBlank() && language != "auto") {
+                    addFormDataPart("language", language)
+                }
+            }
             .addFormDataPart("prompt", sttPrompt)
             .addFormDataPart("file", file.name, file.asRequestBody(octetStream))
             .build()
@@ -491,10 +542,14 @@ class MicrophoneForegroundService : Service() {
             currentCall = call
             call.execute().use { resp ->
                 val respBody = resp.body?.string().orEmpty()
-                if (!resp.isSuccessful) return ""
+                if (!resp.isSuccessful) {
+                    Log.e(tag, "STT failed: HTTP ${resp.code} body=${respBody.take(400)}")
+                    return ""
+                }
                 JSONObject(respBody).optString("text")
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(tag, "STT exception: ${e.javaClass.simpleName}: ${e.message}")
             ""
         } finally {
             currentCall = null
@@ -503,34 +558,69 @@ class MicrophoneForegroundService : Service() {
 
     private fun generateTutorReply(text: String): String {
         val prompt = escapeJson(buildTutorPrompt(text))
-        val payload = """
+        val model = loadDebugPref(KEY_LLM_MODEL) ?: TUTOR_MODEL
+        val effort = loadDebugPref(KEY_REASONING_EFFORT) ?: TUTOR_REASONING_EFFORT
+        val useEffort = effort.isNotBlank() &&
+            !effort.equals("none", ignoreCase = true) &&
+            supportsReasoning(model)
+        if (!useEffort && effort.isNotBlank() && !effort.equals("none", ignoreCase = true)) {
+            Log.d(tag, "Skipping reasoning.effort for model=$model")
+        }
+        val payloadWithEffort = if (useEffort) {
+            """
             {
-              "model": "$TUTOR_MODEL",
+              "model": "$model",
+              "reasoning": { "effort": "$effort" },
+              "temperature": $TUTOR_TEMPERATURE,
+              "top_p": $TUTOR_TOP_P,
+              "input": "$prompt"
+            }
+            """.trimIndent()
+        } else {
+            ""
+        }
+        val payloadNoEffort = """
+            {
+              "model": "$model",
+              "temperature": $TUTOR_TEMPERATURE,
+              "top_p": $TUTOR_TOP_P,
               "input": "$prompt"
             }
         """.trimIndent()
 
-        val req = Request.Builder()
-            .url("https://api.openai.com/v1/responses")
-            .post(payload.toRequestBody(json))
-            .addHeader("Content-Type", "application/json")
-            .addHeader("Authorization", authHeader())
-            .build()
+        fun runPayload(payload: String, label: String): String? {
+            val req = Request.Builder()
+                .url("https://api.openai.com/v1/responses")
+                .post(payload.toRequestBody(json))
+                .addHeader("Content-Type", "application/json")
+                .addHeader("Authorization", authHeader())
+                .build()
 
-        return try {
-            val call = client.newCall(req)
-            currentCall = call
-            call.execute().use { resp ->
-                if (!resp.isSuccessful) return ""
-                val body = resp.body?.string().orEmpty()
-                val output = extractOutputText(body).trim()
-                parseTutorOutput(output, text)
+            return try {
+                val call = client.newCall(req)
+                currentCall = call
+                call.execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        val body = resp.body?.string().orEmpty()
+                        Log.e(tag, "LLM failed ($label): HTTP ${resp.code} body=${body.take(400)}")
+                        return null
+                    }
+                    val body = resp.body?.string().orEmpty()
+                    val output = extractOutputText(body).trim()
+                    parseTutorOutput(output, text)
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "LLM exception ($label): ${e.javaClass.simpleName}: ${e.message}")
+                null
+            } finally {
+                currentCall = null
             }
-        } catch (_: Exception) {
-            ""
-        } finally {
-            currentCall = null
         }
+        if (useEffort) {
+            runPayload(payloadWithEffort, "with reasoning")?.let { return it }
+            Log.d(tag, "Retrying LLM without reasoning.effort")
+        }
+        return runPayload(payloadNoEffort, "no reasoning") ?: ""
     }
 
     private fun buildTutorPrompt(text: String): String {
@@ -585,12 +675,22 @@ You are a language tutor speaking through TTS (audio). The learner speaks Englis
 Level: $tutorLevel. Progress: $progressHint ($knownCount tracked items).
 Language mix: $languageMixHint
 
+Memory slice:
+$memoryBlock
+Notes are explicit, high-priority memory and should be respected. Only suggest a note in memory_suggestions when the user strongly emphasizes a correction or preference; this should be rare.
+
 Goal: produce a helpful, natural next tutor turn that matches the user's intent.
 Decision rule: answer the user's request first; then (if it fits) continue with a short prompt that helps the learner practice something real.
+This is guidance, not a rigid script. Adapt as needed to be a good tutor rather than following rules literally.
+Avoid pointlessly repetitive phrasing. It's fine to reinforce a concept, but do it in a natural, varied way.
+Do not reuse wording from this prompt; avoid template-y phrases and write fresh, natural responses.
 
 Practice loop (what "good tutoring" looks like here):
-- If you introduce a word/phrase, immediately place it in a tiny real-life situation and invite the learner to respond using it.
+- If you introduce a word/phrase, weave it into a simple, natural context and invite the learner to respond using it.
 - Do not "menu" the curriculum (avoid questions like "do you want to learn X or Y next?") unless the user explicitly asks you to pick topics.
+For the most part, avoid using lots of unfamiliar words or grammar at once; stick mainly to what the learner already knows, plus at most a small amount of new material when needed.
+Examples are illustrative, not a template — vary wording and approach.
+Do not over-fixate on a single word. Avoid drilling the same word repeatedly within a short span; reinforce it once, then move on naturally.
 
 Examples:
 - Bad: "We learned 'hola'. Do you want 'good morning' or 'good night' next?"
@@ -603,6 +703,9 @@ TTS formatting constraints (so it sounds natural):
 - Do not include English phonetic spellings for target-language text.
 - Sample conversations are rare; only include them if they genuinely help, and use real names (vary them).
 - Avoid meta-instructions like "repeat after me" or "type". If you invite practice, do it as a normal question.
+STT is imperfect. If the user's utterance seems garbled, do your best to infer intent and respond; if unsure, ask a brief clarification question.
+STT errors are common — strongly consider what the user likely meant to say before responding.
+If the transcript appears to be in an unexpected language, consider what it might have been phonetically in the expected language, and infer the intent.
 
 Meta learning questions: If the user asks about their learning status ("what words do I know? what am I weak at?"), answer directly using the memory slice. You can add a brief next-step suggestion if it fits.
 
@@ -613,9 +716,6 @@ Output JSON only:
   - {type: WORD|PHRASE|GRAMMAR_POINT, display: string, gloss?: string, tags?: [string], outcome?: INTRODUCED|USED|CORRECT|PARTIAL|INCORRECT, error_tags?: [string]}
 
 If you include follow_up_question, make it a practice question (situational, answerable with what the learner knows / just learned), not a meta preference question.
-
-Memory slice:
-$memoryBlock
 
 Recent turns:
 $turnsBlock
@@ -734,14 +834,16 @@ User spoke: $text
         val weak = slice.weakItems.joinToString(", ") { it.display }.ifBlank { "-" }
         val recent = slice.recentItems.joinToString(", ") { it.display }.ifBlank { "-" }
         val errors = slice.frequentErrors.joinToString(", ") { it.tag }.ifBlank { "-" }
-        return "Weak: $weak\nRecent: $recent\nErrors: $errors"
+        val notes = slice.notes.joinToString("; ") { it.text }.ifBlank { "-" }
+        return "Weak: $weak\nRecent: $recent\nErrors: $errors\nNotes: $notes"
     }
 
     private suspend fun playTts(text: String) {
-        val voice = loadTtsVoice()
+        val model = loadTtsModel() ?: loadDebugPref(KEY_TTS_MODEL) ?: TTS_MODEL
+        val voice = loadTtsVoice().ifBlank { loadDebugPref(KEY_TTS_VOICE).orEmpty() }
         val payload = """
             {
-              "model": "$TTS_MODEL",
+              "model": "$model",
               "voice": "$voice",
               "input": "${escapeJson(text)}"
             }
@@ -758,10 +860,15 @@ User spoke: $text
             val call = client.newCall(req)
             currentCall = call
             call.execute().use { resp ->
-                if (!resp.isSuccessful) return
+                if (!resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    Log.e(tag, "TTS failed: HTTP ${resp.code} body=${body.take(400)}")
+                    return
+                }
                 resp.body?.bytes() ?: return
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(tag, "TTS exception: ${e.javaClass.simpleName}: ${e.message}")
             return
         } finally {
             currentCall = null
@@ -866,7 +973,11 @@ User spoke: $text
 
         return try {
             client.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return Action.NONE
+                if (!resp.isSuccessful) {
+                    val body = resp.body?.string().orEmpty()
+                    Log.e(tag, "Classifier failed: HTTP ${resp.code} body=${body.take(400)}")
+                    return Action.NONE
+                }
                 val body = resp.body?.string().orEmpty()
                 val outputText = extractOutputText(body)
                 val obj = JSONObject(outputText)
@@ -876,7 +987,8 @@ User spoke: $text
                     else -> Action.NONE
                 }
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.e(tag, "Classifier exception: ${e.javaClass.simpleName}: ${e.message}")
             Action.NONE
         }
     }
@@ -962,6 +1074,17 @@ User spoke: $text
         }
     }
 
+    private fun shouldClassify(configSnapshot: VadUserConfig, listenSource: String): Boolean {
+        if (listenSource == LISTEN_SOURCE_CHAT) return false
+        if (configSnapshot.alwaysOn) return true
+        if (configSnapshot.manualListening && listenSource == LISTEN_SOURCE_EXTERNAL) return true
+        return false
+    }
+
+    private fun supportsReasoning(model: String): Boolean {
+        return model.startsWith("gpt-5") || model.startsWith("o-")
+    }
+
     private fun isListeningEnabled(): Boolean =
         currentConfig.alwaysOn || currentConfig.manualListening
 
@@ -1024,9 +1147,29 @@ User spoke: $text
         prefs.edit().putString(PipelinePrefs.KEY_PIPELINE_ROUTE, route.value).apply()
     }
 
+    private fun loadListenSource(): String {
+        val prefs = getSharedPreferences(PipelinePrefs.NAME, Context.MODE_PRIVATE)
+        return prefs.getString(PipelinePrefs.KEY_LISTEN_SOURCE, LISTEN_SOURCE_NONE) ?: LISTEN_SOURCE_NONE
+    }
+
+    private fun saveListenSource(source: String) {
+        val prefs = getSharedPreferences(PipelinePrefs.NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(PipelinePrefs.KEY_LISTEN_SOURCE, source).apply()
+    }
+
     private fun loadTtsVoice(): String {
         val prefs = getSharedPreferences(PipelinePrefs.NAME, Context.MODE_PRIVATE)
         return TtsVoiceCatalog.resolve(prefs.getString(PipelinePrefs.KEY_TTS_VOICE, null))
+    }
+
+    private fun loadTtsModel(): String? {
+        val prefs = getSharedPreferences(PipelinePrefs.NAME, Context.MODE_PRIVATE)
+        return prefs.getString(PipelinePrefs.KEY_TTS_MODEL, null)
+    }
+
+    private fun loadDebugPref(key: String): String? {
+        val prefs = getSharedPreferences(DEBUG_PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getString(key, null)
     }
 
     private fun loadTutorContext() {
@@ -1119,6 +1262,9 @@ User spoke: $text
         private const val TUTOR_MODEL = "gpt-5.2"
         private const val TTS_MODEL = "gpt-4o-mini-tts"
         private const val CLASSIFIER_MODEL = "gpt-5.2"
+        private const val TUTOR_REASONING_EFFORT = "high"
+        private const val TUTOR_TEMPERATURE = 0.7
+        private const val TUTOR_TOP_P = 0.9
         private const val ACTION_COOLDOWN_MS = 4000L
         private const val FRAME_MS = 20
         private const val CONFIG_REFRESH_MS = 1000L
@@ -1134,6 +1280,10 @@ User spoke: $text
         const val ACTION_SET_TUTOR_CONTEXT = "com.mystuff.simpletutor.SET_TUTOR_CONTEXT"
         const val ACTION_INTERRUPT = "com.mystuff.simpletutor.INTERRUPT"
         const val EXTRA_ENABLED = "enabled"
+        const val EXTRA_LISTEN_SOURCE = "listenSource"
+        const val LISTEN_SOURCE_CHAT = "chat_button"
+        const val LISTEN_SOURCE_EXTERNAL = "external"
+        const val LISTEN_SOURCE_NONE = "none"
         const val EXTRA_STATE = "state"
         const val EXTRA_ROLE = "role"
         const val EXTRA_TEXT = "text"
@@ -1151,5 +1301,13 @@ User spoke: $text
         private const val KEY_TUTOR_LANG_CODE = "langCode"
         private const val KEY_TUTOR_MODE = "mode"
         private const val KEY_TUTOR_LEVEL = "level"
+        private const val DEBUG_PREFS_NAME = "debug_panel_prefs"
+        private const val KEY_LLM_MODEL = "llm_model"
+        private const val KEY_REASONING_EFFORT = "reasoning_effort"
+        private const val KEY_STT_MODEL = "stt_model"
+        private const val KEY_STT_LANGUAGE = "stt_language"
+        private const val KEY_STT_PROMPT = "stt_prompt"
+        private const val KEY_TTS_MODEL = "tts_model"
+        private const val KEY_TTS_VOICE = "tts_voice"
     }
 }

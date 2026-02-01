@@ -30,6 +30,20 @@ class LearningRepository(context: Context) {
         save(scope, state)
     }
 
+    fun addNote(scope: LearnerScope, text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        val state = load(scope)
+        state.notes.add(
+            LearningNote(
+                id = UUID.randomUUID().toString(),
+                text = trimmed,
+                timestamp = System.currentTimeMillis()
+            )
+        )
+        save(scope, state)
+    }
+
     fun clearTurns(scope: LearnerScope) {
         val state = load(scope)
         state.turns.clear()
@@ -41,6 +55,7 @@ class LearningRepository(context: Context) {
         state.items.clear()
         state.observations.clear()
         state.turns.clear()
+        state.notes.clear()
         save(scope, state)
     }
 
@@ -104,7 +119,8 @@ class LearningRepository(context: Context) {
 class LearningState(
     val items: MutableMap<String, LearningItem> = linkedMapOf(),
     val observations: MutableList<Observation> = mutableListOf(),
-    val turns: MutableList<Turn> = mutableListOf()
+    val turns: MutableList<Turn> = mutableListOf(),
+    val notes: MutableList<LearningNote> = mutableListOf()
 ) {
     fun toJson(): String {
         val obj = JSONObject()
@@ -114,9 +130,12 @@ class LearningState(
         observations.forEach { obsArray.put(it.toJson()) }
         val turnsArray = JSONArray()
         turns.forEach { turnsArray.put(it.toJson()) }
+        val notesArray = JSONArray()
+        notes.forEach { notesArray.put(it.toJson()) }
         obj.put("items", itemsArray)
         obj.put("observations", obsArray)
         obj.put("turns", turnsArray)
+        obj.put("notes", notesArray)
         return obj.toString()
     }
 
@@ -141,6 +160,11 @@ class LearningState(
                     val turnObj = turnsArray.optJSONObject(i) ?: continue
                     state.turns.add(turnFromJson(turnObj))
                 }
+                val notesArray = obj.optJSONArray("notes") ?: JSONArray()
+                for (i in 0 until notesArray.length()) {
+                    val noteObj = notesArray.optJSONObject(i) ?: continue
+                    state.notes.add(learningNoteFromJson(noteObj))
+                }
                 state
             } catch (_: Exception) {
                 LearningState()
@@ -150,12 +174,16 @@ class LearningState(
 }
 
 object LearningSummaryBuilder {
+    private const val MIN_STRENGTH = -3.0f
+    private const val MAX_STRENGTH = 8.0f
+
     fun build(
         state: LearningState,
         weakLimit: Int,
         recentLimit: Int,
         errorLimit: Int,
-        errorWindow: Int
+        errorWindow: Int,
+        notesLimit: Int = 6
     ): MemorySlice {
         val strengths = computeStrengths(state.observations)
         val weakItems = strengths
@@ -172,11 +200,13 @@ object LearningSummaryBuilder {
             .take(recentLimit)
 
         val frequentErrors = computeFrequentErrors(state.observations, errorWindow, errorLimit)
+        val notes = state.notes.takeLast(notesLimit)
 
         return MemorySlice(
             weakItems = weakItems,
             recentItems = recentItems,
-            frequentErrors = frequentErrors
+            frequentErrors = frequentErrors,
+            notes = notes
         )
     }
 
@@ -192,7 +222,7 @@ object LearningSummaryBuilder {
                 ObservationOutcome.INCORRECT -> -1.0f
             }
             obs.itemIds.forEach { id ->
-                scores[id] = (scores[id] ?: 0f) + delta
+                scores[id] = ((scores[id] ?: 0f) + delta).coerceIn(MIN_STRENGTH, MAX_STRENGTH)
                 lastPracticed[id] = maxOf(lastPracticed[id] ?: 0L, obs.timestamp)
             }
         }
@@ -318,5 +348,21 @@ private fun turnFromJson(obj: JSONObject): Turn {
         timestamp = obj.optLong("timestamp"),
         userText = obj.optString("userText"),
         tutorText = obj.optString("tutorText")
+    )
+}
+
+private fun LearningNote.toJson(): JSONObject {
+    val obj = JSONObject()
+    obj.put("id", id)
+    obj.put("text", text)
+    obj.put("timestamp", timestamp)
+    return obj
+}
+
+private fun learningNoteFromJson(obj: JSONObject): LearningNote {
+    return LearningNote(
+        id = obj.optString("id"),
+        text = obj.optString("text"),
+        timestamp = obj.optLong("timestamp")
     )
 }

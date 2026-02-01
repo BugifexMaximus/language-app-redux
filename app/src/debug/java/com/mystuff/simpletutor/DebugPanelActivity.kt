@@ -27,6 +27,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.RequestBody.Companion.asRequestBody
 import java.io.File
+import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.system.measureTimeMillis
@@ -35,10 +36,16 @@ class DebugPanelActivity : AppCompatActivity() {
 
     private data class TtsResult(val message: String, val filePath: String?)
 
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(90, TimeUnit.SECONDS)
+        .build()
     private val json = "application/json".toMediaType()
     private val octetStream = "application/octet-stream".toMediaType()
     private val llmModels = listOf("gpt-5.2", "gpt-5.2-2025-12-11")
+    private val reasoningEfforts = listOf("none", "low", "medium", "high")
     private val sttModels = listOf("gpt-4o-transcribe")
     private val ttsModels = listOf("tts-1", "tts-1-hd", "gpt-4o-mini-tts")
     private val sttLanguages = listOf(
@@ -51,11 +58,23 @@ class DebugPanelActivity : AppCompatActivity() {
     private var isRecording = false
     private var ttsPlayer: MediaPlayer? = null
 
+    companion object {
+        private const val PREFS_NAME = "debug_panel_prefs"
+        private const val KEY_LLM_MODEL = "llm_model"
+        private const val KEY_REASONING_EFFORT = "reasoning_effort"
+        private const val KEY_STT_MODEL = "stt_model"
+        private const val KEY_STT_LANGUAGE = "stt_language"
+        private const val KEY_STT_PROMPT = "stt_prompt"
+        private const val KEY_TTS_MODEL = "tts_model"
+        private const val KEY_TTS_VOICE = "tts_voice"
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_debug_panel)
 
         val llmModelSpinner = findViewById<Spinner>(R.id.llmModelSpinner)
+        val reasoningEffortSpinner = findViewById<Spinner>(R.id.reasoningEffortSpinner)
         val sttModelSpinner = findViewById<Spinner>(R.id.sttModelSpinner)
         val ttsModelSpinner = findViewById<Spinner>(R.id.ttsModelSpinner)
         val sttLanguageSpinner = findViewById<Spinner>(R.id.sttLanguageSpinner)
@@ -77,11 +96,59 @@ class DebugPanelActivity : AppCompatActivity() {
             false
         }
 
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
         llmModelSpinner.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
             llmModels
         )
+
+        reasoningEffortSpinner.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            reasoningEfforts
+        )
+        val savedModel = prefs.getString(KEY_LLM_MODEL, null)
+        if (savedModel != null) {
+            val idx = llmModels.indexOf(savedModel)
+            if (idx >= 0) llmModelSpinner.setSelection(idx)
+        }
+        val savedEffort = prefs.getString(KEY_REASONING_EFFORT, null)
+        if (savedEffort != null) {
+            val idx = reasoningEfforts.indexOf(savedEffort)
+            if (idx >= 0) reasoningEffortSpinner.setSelection(idx)
+        } else {
+            val idx = reasoningEfforts.indexOf("medium")
+            reasoningEffortSpinner.setSelection(if (idx >= 0) idx else 0)
+        }
+
+        fun updateReasoningWarning() {
+            val model = llmModelSpinner.selectedItem?.toString().orEmpty()
+            val effort = reasoningEffortSpinner.selectedItem?.toString().orEmpty()
+            val supports = model.startsWith("gpt-5") || model.startsWith("o-")
+            if (effort.equals("none", ignoreCase = true)) {
+                return
+            }
+            if (!supports && effort.isNotBlank()) {
+                status.text = "Warning: reasoning.effort is only supported for gpt-5 / o-series models."
+            }
+        }
+
+        llmModelSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                prefs.edit().putString(KEY_LLM_MODEL, llmModelSpinner.selectedItem?.toString()).apply()
+                updateReasoningWarning()
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
+        reasoningEffortSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                prefs.edit().putString(KEY_REASONING_EFFORT, reasoningEffortSpinner.selectedItem?.toString()).apply()
+                updateReasoningWarning()
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
 
         sttModelSpinner.adapter = ArrayAdapter(
             this,
@@ -106,6 +173,67 @@ class DebugPanelActivity : AppCompatActivity() {
             android.R.layout.simple_spinner_dropdown_item,
             TtsVoiceCatalog.voices
         )
+
+        val savedSttModel = prefs.getString(KEY_STT_MODEL, null)
+        if (savedSttModel != null) {
+            val idx = sttModels.indexOf(savedSttModel)
+            if (idx >= 0) sttModelSpinner.setSelection(idx)
+        }
+        val savedSttLang = prefs.getString(KEY_STT_LANGUAGE, null)
+        if (savedSttLang != null) {
+            val idx = sttLanguages.indexOf(savedSttLang)
+            if (idx >= 0) sttLanguageSpinner.setSelection(idx)
+        }
+        val savedTtsModel = prefs.getString(KEY_TTS_MODEL, null)
+        if (savedTtsModel != null) {
+            val idx = ttsModels.indexOf(savedTtsModel)
+            if (idx >= 0) ttsModelSpinner.setSelection(idx)
+        }
+        val savedVoice = prefs.getString(KEY_TTS_VOICE, null)
+        if (savedVoice != null) {
+            val idx = TtsVoiceCatalog.voices.indexOf(savedVoice)
+            if (idx >= 0) voiceSpinner.setSelection(idx)
+        }
+        val savedPrompt = prefs.getString(KEY_STT_PROMPT, null)
+        if (savedPrompt != null && savedPrompt != sttPromptEdit.text.toString()) {
+            sttPromptEdit.setText(savedPrompt)
+        }
+
+        sttModelSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                prefs.edit().putString(KEY_STT_MODEL, sttModelSpinner.selectedItem?.toString()).apply()
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
+        sttLanguageSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                prefs.edit().putString(KEY_STT_LANGUAGE, sttLanguageSpinner.selectedItem?.toString()).apply()
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
+        ttsModelSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                prefs.edit().putString(KEY_TTS_MODEL, ttsModelSpinner.selectedItem?.toString()).apply()
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
+        voiceSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                prefs.edit().putString(KEY_TTS_VOICE, voiceSpinner.selectedItem?.toString()).apply()
+                getSharedPreferences(PipelinePrefs.NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(PipelinePrefs.KEY_TTS_VOICE, voiceSpinner.selectedItem?.toString())
+                    .apply()
+            }
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
+        sttPromptEdit.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: android.text.Editable?) {
+                prefs.edit().putString(KEY_STT_PROMPT, s?.toString().orEmpty()).apply()
+            }
+        })
 
 
         fun keySuffix(): String {
@@ -162,8 +290,9 @@ class DebugPanelActivity : AppCompatActivity() {
             CoroutineScope(Dispatchers.Main).launch {
                 val input = inputEdit.text.toString()
                 val model = llmModelSpinner.selectedItem?.toString().orEmpty()
+                val effort = reasoningEffortSpinner.selectedItem?.toString().orEmpty()
                 status.text = "POST /v1/responses (key ${keySuffix()})"
-                val result = withContext(Dispatchers.IO) { testResponses(model, input) }
+                val result = withContext(Dispatchers.IO) { testResponses(model, input, effort) }
                 out.text = result
                 status.text = "Done"
             }
@@ -208,19 +337,29 @@ class DebugPanelActivity : AppCompatActivity() {
 
         var code = -1
         var body = ""
-        val ms = measureTimeMillis {
-            client.newCall(req).execute().use { resp ->
-                code = resp.code
-                body = resp.body?.string().orEmpty()
+        return try {
+            val ms = measureTimeMillis {
+                client.newCall(req).execute().use { resp ->
+                    code = resp.code
+                    body = resp.body?.string().orEmpty()
+                }
             }
+            "HTTP $code (${ms}ms)\n\n$body"
+        } catch (e: Exception) {
+            "Request failed: ${e.javaClass.simpleName}: ${e.message ?: "unknown error"}"
         }
-        return "HTTP $code (${ms}ms)\n\n$body"
     }
 
-    private fun testResponses(model: String, input: String): String {
+    private fun testResponses(model: String, input: String, effort: String): String {
+        val effortBlock = if (effort.isNotBlank() && !effort.equals("none", ignoreCase = true)) {
+            "\"reasoning\": {\"effort\": \"${escapeJson(effort)}\"},"
+        } else {
+            ""
+        }
         val payload = """
             {
               "model": "${escapeJson(model)}",
+              $effortBlock
               "input": "${escapeJson(input)}"
             }
         """.trimIndent()
@@ -234,16 +373,20 @@ class DebugPanelActivity : AppCompatActivity() {
 
         var code = -1
         var body = ""
-        val ms = measureTimeMillis {
-            client.newCall(req).execute().use { resp ->
-                code = resp.code
-                body = resp.body?.string().orEmpty()
+        return try {
+            val ms = measureTimeMillis {
+                client.newCall(req).execute().use { resp ->
+                    code = resp.code
+                    body = resp.body?.string().orEmpty()
+                }
             }
-        }
-        return if (code >= 400) {
-            "HTTP $code (${ms}ms)\n\nError:\n$body"
-        } else {
-            formatResponsesOutput(body)
+            if (code >= 400) {
+                "HTTP $code (${ms}ms)\n\nError:\n$body"
+            } else {
+                formatResponsesOutput(body)
+            }
+        } catch (e: Exception) {
+            "Request failed: ${e.javaClass.simpleName}: ${e.message ?: "unknown error"}\n\nRequest:\n$payload"
         }
     }
 
@@ -270,24 +413,28 @@ class DebugPanelActivity : AppCompatActivity() {
         var bytes = 0
         var filePath = ""
         var errorBody = ""
-        val ms = measureTimeMillis {
-            client.newCall(req).execute().use { resp ->
-                code = resp.code
-                val bodyBytes = resp.body?.bytes() ?: ByteArray(0)
-                if (code >= 400) {
-                    errorBody = bodyBytes.toString(Charsets.UTF_8)
-                } else {
-                    bytes = bodyBytes.size
-                    val outFile = File(cacheDir, "tts_${System.currentTimeMillis()}.mp3")
-                    outFile.writeBytes(bodyBytes)
-                    filePath = outFile.absolutePath
+        return try {
+            val ms = measureTimeMillis {
+                client.newCall(req).execute().use { resp ->
+                    code = resp.code
+                    val bodyBytes = resp.body?.bytes() ?: ByteArray(0)
+                    if (code >= 400) {
+                        errorBody = bodyBytes.toString(Charsets.UTF_8)
+                    } else {
+                        bytes = bodyBytes.size
+                        val outFile = File(cacheDir, "tts_${System.currentTimeMillis()}.mp3")
+                        outFile.writeBytes(bodyBytes)
+                        filePath = outFile.absolutePath
+                    }
                 }
             }
-        }
-        return if (code >= 400) {
-            TtsResult("HTTP $code (${ms}ms)\n\nRequest:\n$payload\n\nError:\n$errorBody", null)
-        } else {
-            TtsResult("HTTP $code (${ms}ms)\nSaved: $filePath\nBytes: $bytes\n\nRequest:\n$payload", filePath)
+            if (code >= 400) {
+                TtsResult("HTTP $code (${ms}ms)\n\nRequest:\n$payload\n\nError:\n$errorBody", null)
+            } else {
+                TtsResult("HTTP $code (${ms}ms)\nSaved: $filePath\nBytes: $bytes\n\nRequest:\n$payload", filePath)
+            }
+        } catch (e: Exception) {
+            TtsResult("Request failed: ${e.javaClass.simpleName}: ${e.message ?: "unknown error"}\n\nRequest:\n$payload", null)
         }
     }
 
@@ -324,16 +471,20 @@ class DebugPanelActivity : AppCompatActivity() {
 
         var code = -1
         var respBody = ""
-        val ms = measureTimeMillis {
-            client.newCall(req).execute().use { resp ->
-                code = resp.code
-                respBody = resp.body?.string().orEmpty()
+        return try {
+            val ms = measureTimeMillis {
+                client.newCall(req).execute().use { resp ->
+                    code = resp.code
+                    respBody = resp.body?.string().orEmpty()
+                }
             }
-        }
-        return if (code >= 400) {
-            "HTTP $code (${ms}ms)\n\nError:\n$respBody"
-        } else {
-            formatTranscribeResponse(respBody)
+            if (code >= 400) {
+                "HTTP $code (${ms}ms)\n\nError:\n$respBody"
+            } else {
+                formatTranscribeResponse(respBody)
+            }
+        } catch (e: Exception) {
+            "Request failed: ${e.javaClass.simpleName}: ${e.message ?: "unknown error"}"
         }
     }
 

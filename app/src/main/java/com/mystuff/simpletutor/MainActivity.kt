@@ -30,6 +30,8 @@ class MainActivity : AppCompatActivity() {
     )
     private val modeOptions = listOf("chat", "practice", "quiz")
     private val levelOptions = listOf("Beginner", "Intermediate", "Advanced", "Grammar")
+    private val reasoningOptions = listOf("none", "low", "medium", "high")
+    private val ttsModelOptions = listOf("gpt-4o-mini-tts", "tts-1", "tts-1-hd")
 
     private lateinit var userLanguagePanel: android.view.View
     private lateinit var modePanel: android.view.View
@@ -41,9 +43,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var loadPreviousCheckbox: CheckBox
     private lateinit var modeContext: TextView
     private lateinit var modeSpecificContext: TextView
+    private lateinit var thinkingContainer: android.view.View
+    private lateinit var thinkingSpinner: Spinner
     private var debugContainer: android.view.View? = null
     private lateinit var voiceStatus: TextView
     private lateinit var voiceActionButton: Button
+    private lateinit var ttsModelSpinner: Spinner
     private lateinit var ttsVoiceSpinner: Spinner
     private lateinit var learningStatusButton: Button
     private lateinit var learningStatusButtonMode: Button
@@ -96,9 +101,12 @@ class MainActivity : AppCompatActivity() {
         loadPreviousCheckbox = findViewById(R.id.load_previous_checkbox)
         modeContext = findViewById(R.id.mode_context)
         modeSpecificContext = findViewById(R.id.mode_specific_context)
+        thinkingContainer = findViewById(R.id.thinking_container)
+        thinkingSpinner = findViewById(R.id.thinking_spinner)
         debugContainer = findViewById(R.id.debug_container)
         voiceStatus = findViewById(R.id.voice_status)
         voiceActionButton = findViewById(R.id.voice_action_button)
+        ttsModelSpinner = findViewById(R.id.tts_model_spinner)
         ttsVoiceSpinner = findViewById(R.id.tts_voice_spinner)
         learningStatusButton = findViewById(R.id.learning_status_button)
         learningStatusButtonMode = findViewById(R.id.learning_status_button_mode)
@@ -139,6 +147,60 @@ class MainActivity : AppCompatActivity() {
             setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         }
 
+        thinkingSpinner.adapter = android.widget.ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_item,
+            reasoningOptions
+        ).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        val debugPrefs = getSharedPreferences(DEBUG_PREFS_NAME, MODE_PRIVATE)
+        val savedReasoning = debugPrefs.getString(KEY_REASONING_EFFORT, "high") ?: "high"
+        val savedReasoningIndex = reasoningOptions.indexOf(savedReasoning).coerceAtLeast(0)
+        thinkingSpinner.setSelection(savedReasoningIndex)
+        debugPrefs.edit().putString(KEY_REASONING_EFFORT, reasoningOptions[savedReasoningIndex]).apply()
+        thinkingSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?,
+                view: android.view.View?,
+                position: Int,
+                id: Long
+            ) {
+                val effort = reasoningOptions.getOrNull(position) ?: "high"
+                debugPrefs.edit().putString(KEY_REASONING_EFFORT, effort).apply()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+
+        val pipelinePrefs = getSharedPreferences(PipelinePrefs.NAME, MODE_PRIVATE)
+
+        ttsModelSpinner.adapter = android.widget.ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_item,
+            ttsModelOptions
+        ).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        val savedTtsModel = pipelinePrefs.getString(PipelinePrefs.KEY_TTS_MODEL, null)
+        val defaultTtsModel = "gpt-4o-mini-tts"
+        val ttsModelIndex = ttsModelOptions.indexOf(savedTtsModel ?: defaultTtsModel).coerceAtLeast(0)
+        ttsModelSpinner.setSelection(ttsModelIndex)
+        pipelinePrefs.edit().putString(PipelinePrefs.KEY_TTS_MODEL, ttsModelOptions[ttsModelIndex]).apply()
+        ttsModelSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?,
+                view: android.view.View?,
+                position: Int,
+                id: Long
+            ) {
+                val model = ttsModelOptions.getOrNull(position) ?: defaultTtsModel
+                pipelinePrefs.edit().putString(PipelinePrefs.KEY_TTS_MODEL, model).apply()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+
         val voiceAdapter = android.widget.ArrayAdapter(
             this,
             android.R.layout.simple_spinner_item,
@@ -147,13 +209,12 @@ class MainActivity : AppCompatActivity() {
             setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         }
         ttsVoiceSpinner.adapter = voiceAdapter
-        val voicePrefs = getSharedPreferences(PipelinePrefs.NAME, MODE_PRIVATE)
         val savedVoice = TtsVoiceCatalog.resolve(
-            voicePrefs.getString(PipelinePrefs.KEY_TTS_VOICE, null)
+            pipelinePrefs.getString(PipelinePrefs.KEY_TTS_VOICE, null)
         )
         val savedIndex = TtsVoiceCatalog.voices.indexOf(savedVoice).coerceAtLeast(0)
         ttsVoiceSpinner.setSelection(savedIndex)
-        voicePrefs.edit().putString(PipelinePrefs.KEY_TTS_VOICE, savedVoice).apply()
+        pipelinePrefs.edit().putString(PipelinePrefs.KEY_TTS_VOICE, savedVoice).apply()
         ttsVoiceSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(
                 parent: AdapterView<*>?,
@@ -162,7 +223,7 @@ class MainActivity : AppCompatActivity() {
                 id: Long
             ) {
                 val voice = TtsVoiceCatalog.voices.getOrNull(position) ?: TtsVoiceCatalog.defaultVoice
-                voicePrefs.edit().putString(PipelinePrefs.KEY_TTS_VOICE, voice).apply()
+                pipelinePrefs.edit().putString(PipelinePrefs.KEY_TTS_VOICE, voice).apply()
             }
 
             override fun onNothingSelected(parent: AdapterView<*>?) = Unit
@@ -182,6 +243,8 @@ class MainActivity : AppCompatActivity() {
             val level = levelSpinner.selectedItem?.toString() ?: "Beginner"
             modeSpecificContext.text =
                 "User: $userId | Language: ${language.label} (${language.code}) | Mode: $mode | Level: $level"
+            thinkingContainer.visibility =
+                if (mode.equals("chat", ignoreCase = true)) android.view.View.VISIBLE else android.view.View.GONE
             showPanel(modeSpecificPanel)
             sendTutorContext(userId, language, mode, level)
             if (!loadPreviousCheckbox.isChecked) {
@@ -215,6 +278,7 @@ class MainActivity : AppCompatActivity() {
             val intent = Intent(this, MicrophoneForegroundService::class.java).apply {
                 action = MicrophoneForegroundService.ACTION_SET_MANUAL_LISTEN
                 putExtra(MicrophoneForegroundService.EXTRA_ENABLED, !isListening)
+                putExtra(MicrophoneForegroundService.EXTRA_LISTEN_SOURCE, MicrophoneForegroundService.LISTEN_SOURCE_CHAT)
             }
             ContextCompat.startForegroundService(this, intent)
             setPipelineRoute("tutor")
@@ -440,5 +504,10 @@ class MainActivity : AppCompatActivity() {
         ) {
             startMicrophoneService()
         }
+    }
+
+    companion object {
+        private const val DEBUG_PREFS_NAME = "debug_panel_prefs"
+        private const val KEY_REASONING_EFFORT = "reasoning_effort"
     }
 }

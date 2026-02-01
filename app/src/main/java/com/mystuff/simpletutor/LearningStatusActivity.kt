@@ -25,6 +25,7 @@ class LearningStatusActivity : AppCompatActivity() {
         val countsText = findViewById<TextView>(R.id.learning_counts_text)
         val memoryText = findViewById<TextView>(R.id.learning_memory_text)
         val errorsText = findViewById<TextView>(R.id.learning_errors_text)
+        val notesText = findViewById<TextView>(R.id.learning_notes_text)
         val turnsText = findViewById<TextView>(R.id.learning_turns_text)
         val purgeButton = findViewById<Button>(R.id.learning_purge_button)
 
@@ -34,6 +35,7 @@ class LearningStatusActivity : AppCompatActivity() {
             countsText.text = ""
             memoryText.text = ""
             errorsText.text = ""
+            notesText.text = ""
             turnsText.text = ""
             purgeButton.isEnabled = false
             return
@@ -87,6 +89,11 @@ class LearningStatusActivity : AppCompatActivity() {
             }
         }.ifBlank { "- none" }
         errorsText.text = errorBlock
+
+        val notesBlock = packet.memorySlice.notes.joinToString("\n") { note ->
+            "- ${note.text}"
+        }.ifBlank { "- none" }
+        notesText.text = notesBlock
 
         val turnsBlock = packet.recentTurns.joinToString("\n\n") { turn ->
             "User: ${turn.userText}\nTutor: ${turn.tutorText}"

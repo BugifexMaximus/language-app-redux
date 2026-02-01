@@ -37,6 +37,7 @@ Last updated: 2026-02-01
 - Verify manual listening UX on a physical device.
 - Consider replacing the banner activity with an in-app overlay to avoid pausing other screens.
 - Flesh out mode-specific panels once the designs are ready.
+- Verify chat pipeline end-to-end (STT -> LLM -> TTS) on emulator.
 
 ## Notes
 - `codex-TODO.md` is being used as a running task list.

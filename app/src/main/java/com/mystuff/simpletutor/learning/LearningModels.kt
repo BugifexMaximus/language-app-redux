@@ -54,6 +54,12 @@ data class Turn(
     val tutorText: String
 )
 
+data class LearningNote(
+    val id: String,
+    val text: String,
+    val timestamp: Long
+)
+
 data class ItemStrength(
     val itemId: String,
     val strength: Float,
@@ -69,7 +75,8 @@ data class ErrorStat(
 data class MemorySlice(
     val weakItems: List<LearningItem>,
     val recentItems: List<LearningItem>,
-    val frequentErrors: List<ErrorStat>
+    val frequentErrors: List<ErrorStat>,
+    val notes: List<LearningNote>
 )
 
 data class LearnerSnapshot(

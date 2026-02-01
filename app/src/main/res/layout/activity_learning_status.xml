@@ -71,6 +71,21 @@
             android:text="-" />
 
         <TextView
+            android:id="@+id/learning_notes_label"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Notes"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/learning_notes_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            android:text="-" />
+
+        <TextView
             android:id="@+id/learning_turns_label"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
