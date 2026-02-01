@@ -105,6 +105,25 @@
                 android:layout_height="wrap_content" />
 
             <Button
+                android:id="@+id/learning_status_button_mode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Learning Status" />
+
+            <TextView
+                android:id="@+id/level_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Pick level" />
+
+            <Spinner
+                android:id="@+id/level_spinner"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <Button
                 android:id="@+id/start_button"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -135,6 +154,27 @@
                 android:layout_marginTop="8dp"
                 android:text="User: - | Language: - | Mode: -" />
 
+            <CheckBox
+                android:id="@+id/load_previous_checkbox"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Load previous chat context" />
+
+            <Button
+                android:id="@+id/back_home_button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="Back to Home" />
+
+            <Button
+                android:id="@+id/learning_status_button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="Learning Status" />
+
             <TextView
                 android:id="@+id/chat_log_label"
                 android:layout_width="wrap_content"
@@ -164,7 +204,8 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
-                android:orientation="horizontal">
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
 
                 <TextView
                     android:id="@+id/voice_status"
@@ -173,10 +214,30 @@
                     android:layout_weight="1"
                     android:text="Status: Offline" />
 
+                <LinearLayout
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:orientation="vertical">
+
+                    <TextView
+                        android:id="@+id/tts_voice_label"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Voice"
+                        android:textSize="12sp" />
+
+                    <Spinner
+                        android:id="@+id/tts_voice_spinner"
+                        android:layout_width="140dp"
+                        android:layout_height="wrap_content" />
+                </LinearLayout>
+
                 <Button
                     android:id="@+id/voice_action_button"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
                     android:text="Start listening" />
             </LinearLayout>
         </LinearLayout>

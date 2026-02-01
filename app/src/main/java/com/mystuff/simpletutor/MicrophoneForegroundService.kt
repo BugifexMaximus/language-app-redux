@@ -39,13 +39,26 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Call
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
+import kotlinx.coroutines.CancellableContinuation
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.suspendCoroutine
+import com.mystuff.simpletutor.learning.ItemSource
+import com.mystuff.simpletutor.learning.LearnerScope
+import com.mystuff.simpletutor.learning.LearningItem
+import com.mystuff.simpletutor.learning.LearningItemId
+import com.mystuff.simpletutor.learning.LearningItemType
+import com.mystuff.simpletutor.learning.LearningRepository
+import com.mystuff.simpletutor.learning.Observation
+import com.mystuff.simpletutor.learning.ObservationOutcome
 
 class MicrophoneForegroundService : Service() {
     private enum class Action { OPEN_DEBUG, GO_HOME, NONE }
@@ -73,6 +86,12 @@ class MicrophoneForegroundService : Service() {
     private var tutorLanguageLabel: String = "Japanese"
     private var tutorLanguageCode: String = "ja-JP"
     private var tutorMode: String = "chat"
+    private var tutorLevel: String = "Beginner"
+    private var learningRepo: LearningRepository? = null
+    private val interruptToken = AtomicLong(0)
+    private var ttsPlayer: MediaPlayer? = null
+    @Volatile private var currentCall: Call? = null
+    @Volatile private var ttsContinuation: CancellableContinuation<Unit>? = null
     private var pipelineRoute: PipelineRoute = PipelineRoute.TEST_STT
     private var lastConfigCheckMs: Long = 0L
     private var lastLevelBroadcastMs: Long = 0L
@@ -80,6 +99,8 @@ class MicrophoneForegroundService : Service() {
     private var framesSinceLog: Int = 0
     private var speechFramesSinceLog: Int = 0
     private var noiseDbfs: Float = -60f
+    private var currentPipelineState: String = "Offline"
+    private var lastUiBroadcastMs: Long = 0L
     @Volatile private var pendingManualStop: Boolean = false
     @Volatile private var configDirty: Boolean = false
     private val sendMutex = Mutex()
@@ -104,8 +125,10 @@ class MicrophoneForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        learningRepo = LearningRepository(this)
         currentConfig = VadConfigStore.load(this)
         pipelineRoute = loadPipelineRoute()
+        loadTutorContext()
         Log.d(tag, "Service created: alwaysOn=${currentConfig.alwaysOn}, manual=${currentConfig.manualListening}")
         ContextCompat.registerReceiver(
             this,
@@ -140,7 +163,16 @@ class MicrophoneForegroundService : Service() {
                 tutorLanguageLabel = intent.getStringExtra(EXTRA_LANG_LABEL) ?: tutorLanguageLabel
                 tutorLanguageCode = intent.getStringExtra(EXTRA_LANG_CODE) ?: tutorLanguageCode
                 tutorMode = intent.getStringExtra(EXTRA_MODE) ?: tutorMode
-                Log.d(tag, "Tutor context: user=$tutorUserId, lang=$tutorLanguageLabel ($tutorLanguageCode), mode=$tutorMode")
+                tutorLevel = intent.getStringExtra(EXTRA_LEVEL) ?: tutorLevel
+                saveTutorContext()
+                Log.d(tag, "Tutor context: user=$tutorUserId, lang=$tutorLanguageLabel ($tutorLanguageCode), mode=$tutorMode, level=$tutorLevel")
+            }
+            ACTION_INTERRUPT -> {
+                interruptToken.incrementAndGet()
+                currentCall?.cancel()
+                stopTtsPlayback()
+                cancelTtsContinuation()
+                broadcastPipelineState(if (isListeningEnabled()) "Listening" else "Offline")
             }
         }
         startListeningLoop()
@@ -223,6 +255,7 @@ class MicrophoneForegroundService : Service() {
             val byteBuffer = ByteArray(VadConfig.frameSizeSamples * 2)
 
             suspend fun sendUtterance(bytes: ByteArray, configSnapshot: VadUserConfig) {
+                val localToken = interruptToken.get()
                 val wavFile = File(cacheDir, "utt_${System.currentTimeMillis()}.wav")
                 WavWriter.writePcm16Mono(wavFile, bytes, VadConfig.sampleRateHz)
                 val durationMs = (bytes.size / 2.0 / VadConfig.sampleRateHz * 1000).toInt()
@@ -231,6 +264,13 @@ class MicrophoneForegroundService : Service() {
                 }
                 broadcastPipelineState("Thinking")
                 val transcript = transcribe(wavFile)
+                if (interruptToken.get() != localToken) {
+                    broadcastPipelineState(if (isListeningEnabled()) "Listening" else "Offline")
+                    if (pipelineRoute == PipelineRoute.TEST_STT) {
+                        hideStatusBanner()
+                    }
+                    return
+                }
                 if (transcript.isNotBlank() && transcript != lastTranscript) {
                     lastTranscript = transcript
                     if (pipelineRoute == PipelineRoute.TEST_STT && configSnapshot.showTranscriptPopup) {
@@ -239,6 +279,13 @@ class MicrophoneForegroundService : Service() {
                     if (pipelineRoute == PipelineRoute.TUTOR) {
                         broadcastChatMessage("user", transcript)
                         val response = generateTutorReply(transcript)
+                        if (interruptToken.get() != localToken) {
+                            broadcastPipelineState(if (isListeningEnabled()) "Listening" else "Offline")
+                            if (pipelineRoute == PipelineRoute.TEST_STT) {
+                                hideStatusBanner()
+                            }
+                            return
+                        }
                         if (response.isNotBlank()) {
                             broadcastChatMessage("tutor", response)
                             broadcastPipelineState("Speaking")
@@ -266,6 +313,7 @@ class MicrophoneForegroundService : Service() {
             }
 
             while (isActive) {
+                maybeBroadcastUiState()
                 if (pendingManualStop) {
                     pendingManualStop = false
                     val forced = segmenter.forceEmitBuffer()
@@ -424,9 +472,11 @@ class MicrophoneForegroundService : Service() {
     private fun transcribe(file: File): String {
         if (!file.exists() || file.length() == 0L) return ""
         Log.d(tag, "Transcribing ${file.name} (${file.length()} bytes)")
+        val sttPrompt = "English or $tutorLanguageLabel"
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("model", STT_MODEL)
+            .addFormDataPart("prompt", sttPrompt)
             .addFormDataPart("file", file.name, file.asRequestBody(octetStream))
             .build()
 
@@ -437,13 +487,17 @@ class MicrophoneForegroundService : Service() {
             .build()
 
         return try {
-            client.newCall(req).execute().use { resp ->
+            val call = client.newCall(req)
+            currentCall = call
+            call.execute().use { resp ->
                 val respBody = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) return ""
                 JSONObject(respBody).optString("text")
             }
         } catch (_: Exception) {
             ""
+        } finally {
+            currentCall = null
         }
     }
 
@@ -464,25 +518,231 @@ class MicrophoneForegroundService : Service() {
             .build()
 
         return try {
-            client.newCall(req).execute().use { resp ->
+            val call = client.newCall(req)
+            currentCall = call
+            call.execute().use { resp ->
                 if (!resp.isSuccessful) return ""
                 val body = resp.body?.string().orEmpty()
-                extractOutputText(body).trim()
+                val output = extractOutputText(body).trim()
+                parseTutorOutput(output, text)
             }
         } catch (_: Exception) {
             ""
+        } finally {
+            currentCall = null
         }
     }
 
     private fun buildTutorPrompt(text: String): String {
-        return "You are a friendly language tutor. The learner speaks English and is practicing $tutorLanguageLabel. Reply in $tutorLanguageLabel with short, natural responses, and include brief English help only if needed. User said: $text"
+        val scope = LearnerScope(tutorUserId, tutorLanguageCode)
+        val packet = learningRepo?.buildContextPacket(
+            scope = scope,
+            level = tutorLevel,
+            preferences = "Short responses. Correct lightly. Ask a follow-up question only when it feels natural.",
+            weakLimit = 6,
+            recentLimit = 6,
+            errorLimit = 4,
+            errorWindow = 60,
+            recentTurns = 4
+        )
+        val knownCount = learningRepo?.load(scope)?.items?.size ?: 0
+        val memoryBlock = packet?.let { formatMemorySlice(it.memorySlice) } ?: "Weak: -\nRecent: -\nErrors: -"
+        val turnsBlock = packet?.recentTurns?.joinToString("\n") { turn ->
+            "User: ${turn.userText}\nTutor: ${turn.tutorText}"
+        }.orEmpty()
+        val progressHint = when {
+            knownCount <= 0 -> "brand new"
+            knownCount < 10 -> "very early"
+            knownCount < 40 -> "early"
+            knownCount < 120 -> "building"
+            else -> "established"
+        }
+        val languageMixHint = when (tutorLevel.lowercase()) {
+            "beginner" -> when {
+                knownCount < 10 -> "Mostly English. Use short target-language phrases when helpful."
+                knownCount < 40 -> "English-led, with more target-language phrases/sentences."
+                else -> "Balanced mix; lean more into the target language when it feels natural."
+            }
+            "intermediate" -> "Mostly target language, with brief English clarifications as needed."
+            "advanced" -> "Target language almost entirely; English only if truly needed."
+            "grammar" -> "Explain in English, show short target-language examples."
+            else -> "Balanced mix."
+        }
+        val coreGuidance = when (tutorLevel.lowercase()) {
+            "beginner" -> """
+Keep the pace gentle. Be responsive to what the user actually asked.
+Avoid overwhelming the learner. If you give a longer example, keep it simple and do not pack it with many new words/grammar at once.
+When you introduce something new, use it in a natural sentence and then continue the conversation with one relevant question.
+Avoid scripted drills and repetitive coaching phrasing.
+            """.trimIndent()
+            "intermediate" -> "Be conversational and helpful; focus on fluency and natural phrasing."
+            "advanced" -> "Be concise and natural; prioritize nuance and idiomatic usage."
+            "grammar" -> "Be clear and practical; focus on one grammar point with examples."
+            else -> "Be conversational and helpful."
+        }
+        return """
+You are a language tutor speaking through TTS (audio). The learner speaks English and is practicing $tutorLanguageLabel.
+Level: $tutorLevel. Progress: $progressHint ($knownCount tracked items).
+Language mix: $languageMixHint
+
+Goal: produce a helpful, natural next tutor turn that matches the user's intent.
+Decision rule: answer the user's request first; then (if it fits) continue with a short prompt that helps the learner practice something real.
+
+Practice loop (what "good tutoring" looks like here):
+- If you introduce a word/phrase, immediately place it in a tiny real-life situation and invite the learner to respond using it.
+- Do not "menu" the curriculum (avoid questions like "do you want to learn X or Y next?") unless the user explicitly asks you to pick topics.
+
+Examples:
+- Bad: "We learned 'hola'. Do you want 'good morning' or 'good night' next?"
+- Good: "Nice. 'Hola' is 'hi'. You see your friend at a cafe - what do you say?"
+
+$coreGuidance
+
+TTS formatting constraints (so it sounds natural):
+- Do not use "A:"/"B:" or "Tutor:"/"User:" labels.
+- Do not include English phonetic spellings for target-language text.
+- Sample conversations are rare; only include them if they genuinely help, and use real names (vary them).
+- Avoid meta-instructions like "repeat after me" or "type". If you invite practice, do it as a normal question.
+
+Meta learning questions: If the user asks about their learning status ("what words do I know? what am I weak at?"), answer directly using the memory slice. You can add a brief next-step suggestion if it fits.
+
+Output JSON only:
+- assistant_text: what you will say (this is spoken by TTS)
+- follow_up_question: optional, only if it feels natural; when present, prefer a practice question tied to the user's message or the just-introduced item
+- memory_suggestions: optional list, only if you are confident; keep it small and high-signal (prefer 0-2 items)
+  - {type: WORD|PHRASE|GRAMMAR_POINT, display: string, gloss?: string, tags?: [string], outcome?: INTRODUCED|USED|CORRECT|PARTIAL|INCORRECT, error_tags?: [string]}
+
+If you include follow_up_question, make it a practice question (situational, answerable with what the learner knows / just learned), not a meta preference question.
+
+Memory slice:
+$memoryBlock
+
+Recent turns:
+$turnsBlock
+
+User spoke: $text
+        """.trimIndent()
+    }
+
+    private fun parseTutorOutput(output: String, userText: String): String {
+        val obj = extractJsonObject(output)
+        if (obj == null) {
+            recordTurn(userText, output)
+            return output
+        }
+        val assistantText = obj.optString("assistant_text").trim()
+        val followUp = obj.optString("follow_up_question").trim()
+        val combined = buildString {
+            if (assistantText.isNotBlank()) append(assistantText)
+            if (followUp.isNotBlank()) {
+                if (isNotEmpty()) append("\n\n")
+                append(followUp)
+            }
+        }.ifBlank { output }
+        handleMemorySuggestions(obj.optJSONArray("memory_suggestions"), userText, combined)
+        recordTurn(userText, combined)
+        return combined
+    }
+
+    private fun extractJsonObject(output: String): JSONObject? {
+        val trimmed = output.trim()
+        if (trimmed.isEmpty()) return null
+        val noFence = if (trimmed.startsWith("```")) {
+            trimmed.replace(Regex("^```[a-zA-Z]*\\s*"), "").replace(Regex("\\s*```$"), "").trim()
+        } else {
+            trimmed
+        }
+        if (noFence.startsWith("{") && noFence.endsWith("}")) {
+            return runCatching { JSONObject(noFence) }.getOrNull()
+        }
+        val start = noFence.indexOf('{')
+        val end = noFence.lastIndexOf('}')
+        if (start >= 0 && end > start) {
+            val slice = noFence.substring(start, end + 1)
+            return runCatching { JSONObject(slice) }.getOrNull()
+        }
+        return null
+    }
+
+    private fun handleMemorySuggestions(suggestions: JSONArray?, userText: String, tutorText: String) {
+        if (suggestions == null) return
+        val repo = learningRepo ?: return
+        val scope = LearnerScope(tutorUserId, tutorLanguageCode)
+        val now = System.currentTimeMillis()
+        // Hard cap to prevent a long example response from exploding memory.
+        val n = minOf(suggestions.length(), MAX_MEMORY_SUGGESTIONS_PER_TURN)
+        for (i in 0 until n) {
+            val obj = suggestions.optJSONObject(i) ?: continue
+            val typeRaw = obj.optString("type").uppercase()
+            val type = runCatching { LearningItemType.valueOf(typeRaw) }.getOrNull() ?: continue
+            val display = obj.optString("display").trim()
+            if (display.isBlank()) continue
+            val gloss = obj.optString("gloss").trim().ifBlank { null }
+            val tags = obj.optJSONArray("tags")?.let { array ->
+                val list = mutableListOf<String>()
+                for (j in 0 until array.length()) {
+                    val value = array.optString(j)
+                    if (value.isNotBlank()) list.add(value)
+                }
+                list
+            } ?: emptyList()
+            val outcomeRaw = obj.optString("outcome").uppercase()
+            val outcome = runCatching { ObservationOutcome.valueOf(outcomeRaw) }.getOrNull()
+            val errors = obj.optJSONArray("error_tags")?.let { array ->
+                val list = mutableListOf<String>()
+                for (j in 0 until array.length()) {
+                    val value = array.optString(j)
+                    if (value.isNotBlank()) list.add(value)
+                }
+                list
+            } ?: emptyList()
+            val id = LearningItemId.from(type, tutorLanguageCode, display)
+            val item = LearningItem(
+                id = id,
+                type = type,
+                language = tutorLanguageCode,
+                display = display,
+                gloss = gloss,
+                tags = tags,
+                firstSeen = now,
+                lastSeen = now,
+                source = ItemSource.INTRODUCED
+            )
+            repo.upsertItem(scope, item)
+            if (outcome != null) {
+                val observation = Observation(
+                    id = UUID.randomUUID().toString(),
+                    timestamp = now,
+                    userText = userText,
+                    tutorText = tutorText,
+                    itemIds = listOf(id),
+                    outcome = outcome,
+                    errorTags = errors
+                )
+                repo.recordObservation(scope, observation)
+            }
+        }
+    }
+
+    private fun recordTurn(userText: String, tutorText: String) {
+        val repo = learningRepo ?: return
+        val scope = LearnerScope(tutorUserId, tutorLanguageCode)
+        repo.recordTurn(scope, userText, tutorText, limit = 6)
+    }
+
+    private fun formatMemorySlice(slice: com.mystuff.simpletutor.learning.MemorySlice): String {
+        val weak = slice.weakItems.joinToString(", ") { it.display }.ifBlank { "-" }
+        val recent = slice.recentItems.joinToString(", ") { it.display }.ifBlank { "-" }
+        val errors = slice.frequentErrors.joinToString(", ") { it.tag }.ifBlank { "-" }
+        return "Weak: $weak\nRecent: $recent\nErrors: $errors"
     }
 
     private suspend fun playTts(text: String) {
+        val voice = loadTtsVoice()
         val payload = """
             {
               "model": "$TTS_MODEL",
-              "voice": "$TTS_VOICE",
+              "voice": "$voice",
               "input": "${escapeJson(text)}"
             }
         """.trimIndent()
@@ -495,30 +755,55 @@ class MicrophoneForegroundService : Service() {
             .build()
 
         val audioBytes = try {
-            client.newCall(req).execute().use { resp ->
+            val call = client.newCall(req)
+            currentCall = call
+            call.execute().use { resp ->
                 if (!resp.isSuccessful) return
                 resp.body?.bytes() ?: return
             }
         } catch (_: Exception) {
             return
+        } finally {
+            currentCall = null
         }
 
         val outFile = File(cacheDir, "tts_${System.currentTimeMillis()}.mp3")
         outFile.writeBytes(audioBytes)
-        playAudioFile(outFile)
+        try {
+            playAudioFile(outFile)
+        } catch (_: Exception) {
+        }
     }
 
     private suspend fun playAudioFile(file: File) {
         if (!file.exists()) return
-        suspendCoroutine<Unit> { cont ->
+        suspendCancellableCoroutine<Unit> { cont ->
+            stopTtsPlayback()
+            ttsContinuation = cont
+            cont.invokeOnCancellation {
+                stopTtsPlayback()
+            }
             val player = MediaPlayer()
+            ttsPlayer = player
             player.setOnPreparedListener { it.start() }
             player.setOnCompletionListener {
                 it.release()
+                if (ttsPlayer === it) {
+                    ttsPlayer = null
+                }
+                if (ttsContinuation === cont) {
+                    ttsContinuation = null
+                }
                 cont.resume(Unit)
             }
             player.setOnErrorListener { mp, _, _ ->
                 mp.release()
+                if (ttsPlayer === mp) {
+                    ttsPlayer = null
+                }
+                if (ttsContinuation === cont) {
+                    ttsContinuation = null
+                }
                 cont.resume(Unit)
                 true
             }
@@ -527,10 +812,42 @@ class MicrophoneForegroundService : Service() {
                 player.prepareAsync()
             } catch (e: Exception) {
                 player.release()
+                if (ttsPlayer === player) {
+                    ttsPlayer = null
+                }
+                if (ttsContinuation === cont) {
+                    ttsContinuation = null
+                }
                 cont.resume(Unit)
             }
         }
     }
+
+    private fun stopTtsPlayback() {
+        val player = ttsPlayer ?: return
+        try {
+            if (player.isPlaying) {
+                player.stop()
+            }
+        } catch (_: Exception) {
+        } finally {
+            player.release()
+            if (ttsPlayer === player) {
+                ttsPlayer = null
+            }
+        }
+    }
+
+    private fun cancelTtsContinuation() {
+        val cont = ttsContinuation ?: return
+        if (cont.isActive) {
+            cont.cancel()
+        }
+        if (ttsContinuation === cont) {
+            ttsContinuation = null
+        }
+    }
+
 
     private fun classify(text: String): Action {
         val payload = """
@@ -680,20 +997,56 @@ class MicrophoneForegroundService : Service() {
     }
 
     private fun broadcastPipelineState(state: String) {
+        currentPipelineState = state
         val intent = Intent(ACTION_PIPELINE_STATE)
             .setPackage(packageName)
             .putExtra(EXTRA_STATE, state)
         sendBroadcast(intent)
     }
 
+    private fun maybeBroadcastUiState() {
+        val now = System.currentTimeMillis()
+        if (now - lastUiBroadcastMs < UI_BROADCAST_MS) return
+        lastUiBroadcastMs = now
+        broadcastListeningStatus()
+        broadcastPipelineState(currentPipelineState)
+    }
+
     private fun loadPipelineRoute(): PipelineRoute {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return PipelineRoute.fromValue(prefs.getString(PREF_PIPELINE_ROUTE, PipelineRoute.TEST_STT.value))
+        val prefs = getSharedPreferences(PipelinePrefs.NAME, Context.MODE_PRIVATE)
+        return PipelineRoute.fromValue(
+            prefs.getString(PipelinePrefs.KEY_PIPELINE_ROUTE, PipelineRoute.TEST_STT.value)
+        )
     }
 
     private fun savePipelineRoute(route: PipelineRoute) {
-        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit().putString(PREF_PIPELINE_ROUTE, route.value).apply()
+        val prefs = getSharedPreferences(PipelinePrefs.NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(PipelinePrefs.KEY_PIPELINE_ROUTE, route.value).apply()
+    }
+
+    private fun loadTtsVoice(): String {
+        val prefs = getSharedPreferences(PipelinePrefs.NAME, Context.MODE_PRIVATE)
+        return TtsVoiceCatalog.resolve(prefs.getString(PipelinePrefs.KEY_TTS_VOICE, null))
+    }
+
+    private fun loadTutorContext() {
+        val prefs = getSharedPreferences(TUTOR_PREFS, Context.MODE_PRIVATE)
+        tutorUserId = prefs.getString(KEY_TUTOR_USER, tutorUserId) ?: tutorUserId
+        tutorLanguageLabel = prefs.getString(KEY_TUTOR_LANG_LABEL, tutorLanguageLabel) ?: tutorLanguageLabel
+        tutorLanguageCode = prefs.getString(KEY_TUTOR_LANG_CODE, tutorLanguageCode) ?: tutorLanguageCode
+        tutorMode = prefs.getString(KEY_TUTOR_MODE, tutorMode) ?: tutorMode
+        tutorLevel = prefs.getString(KEY_TUTOR_LEVEL, tutorLevel) ?: tutorLevel
+    }
+
+    private fun saveTutorContext() {
+        val prefs = getSharedPreferences(TUTOR_PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(KEY_TUTOR_USER, tutorUserId)
+            .putString(KEY_TUTOR_LANG_LABEL, tutorLanguageLabel)
+            .putString(KEY_TUTOR_LANG_CODE, tutorLanguageCode)
+            .putString(KEY_TUTOR_MODE, tutorMode)
+            .putString(KEY_TUTOR_LEVEL, tutorLevel)
+            .apply()
     }
 
     private fun maxAbs(samples: ShortArray, count: Int): Int {
@@ -765,12 +1118,12 @@ class MicrophoneForegroundService : Service() {
         private const val STT_MODEL = "gpt-4o-transcribe"
         private const val TUTOR_MODEL = "gpt-5.2"
         private const val TTS_MODEL = "gpt-4o-mini-tts"
-        private const val TTS_VOICE = "alloy"
         private const val CLASSIFIER_MODEL = "gpt-5.2"
         private const val ACTION_COOLDOWN_MS = 4000L
         private const val FRAME_MS = 20
         private const val CONFIG_REFRESH_MS = 1000L
         private const val LEVEL_BROADCAST_MS = 200L
+        private const val UI_BROADCAST_MS = 1500L
         const val ACTION_LEVEL = "com.mystuff.simpletutor.VAD_LEVEL"
         const val ACTION_CONFIG_CHANGED = "com.mystuff.simpletutor.VAD_CONFIG_CHANGED"
         const val ACTION_LISTENING_STATUS = "com.mystuff.simpletutor.VAD_LISTENING_STATUS"
@@ -779,6 +1132,7 @@ class MicrophoneForegroundService : Service() {
         const val ACTION_SET_MANUAL_LISTEN = "com.mystuff.simpletutor.SET_MANUAL_LISTEN"
         const val ACTION_SET_PIPELINE_ROUTE = "com.mystuff.simpletutor.SET_PIPELINE_ROUTE"
         const val ACTION_SET_TUTOR_CONTEXT = "com.mystuff.simpletutor.SET_TUTOR_CONTEXT"
+        const val ACTION_INTERRUPT = "com.mystuff.simpletutor.INTERRUPT"
         const val EXTRA_ENABLED = "enabled"
         const val EXTRA_STATE = "state"
         const val EXTRA_ROLE = "role"
@@ -788,8 +1142,14 @@ class MicrophoneForegroundService : Service() {
         const val EXTRA_LANG_LABEL = "langLabel"
         const val EXTRA_LANG_CODE = "langCode"
         const val EXTRA_MODE = "mode"
+        const val EXTRA_LEVEL = "level"
         private const val NOISE_ALPHA = 0.1f
-        private const val PREFS_NAME = "pipeline_prefs"
-        private const val PREF_PIPELINE_ROUTE = "pipeline_route"
+        private const val MAX_MEMORY_SUGGESTIONS_PER_TURN = 2
+        private const val TUTOR_PREFS = "tutor_context"
+        private const val KEY_TUTOR_USER = "userId"
+        private const val KEY_TUTOR_LANG_LABEL = "langLabel"
+        private const val KEY_TUTOR_LANG_CODE = "langCode"
+        private const val KEY_TUTOR_MODE = "mode"
+        private const val KEY_TUTOR_LEVEL = "level"
     }
 }

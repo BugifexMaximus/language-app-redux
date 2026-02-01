@@ -9,6 +9,8 @@ import android.widget.Button
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.LinearLayout
+import android.widget.AdapterView
+import android.widget.CheckBox
 import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AlertDialog
@@ -27,6 +29,7 @@ class MainActivity : AppCompatActivity() {
         LanguageOption("Korean (South)", "ko-KR")
     )
     private val modeOptions = listOf("chat", "practice", "quiz")
+    private val levelOptions = listOf("Beginner", "Intermediate", "Advanced", "Grammar")
 
     private lateinit var userLanguagePanel: android.view.View
     private lateinit var modePanel: android.view.View
@@ -34,11 +37,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var userSpinner: Spinner
     private lateinit var languageSpinner: Spinner
     private lateinit var modeSpinner: Spinner
+    private lateinit var levelSpinner: Spinner
+    private lateinit var loadPreviousCheckbox: CheckBox
     private lateinit var modeContext: TextView
     private lateinit var modeSpecificContext: TextView
     private var debugContainer: android.view.View? = null
     private lateinit var voiceStatus: TextView
     private lateinit var voiceActionButton: Button
+    private lateinit var ttsVoiceSpinner: Spinner
+    private lateinit var learningStatusButton: Button
+    private lateinit var learningStatusButtonMode: Button
+    private lateinit var backHomeButton: Button
     private lateinit var chatLog: LinearLayout
     private lateinit var chatLogScroll: android.widget.ScrollView
     private var isListening = false
@@ -83,11 +92,17 @@ class MainActivity : AppCompatActivity() {
         userSpinner = findViewById(R.id.user_spinner)
         languageSpinner = findViewById(R.id.language_spinner)
         modeSpinner = findViewById(R.id.mode_spinner)
+        levelSpinner = findViewById(R.id.level_spinner)
+        loadPreviousCheckbox = findViewById(R.id.load_previous_checkbox)
         modeContext = findViewById(R.id.mode_context)
         modeSpecificContext = findViewById(R.id.mode_specific_context)
         debugContainer = findViewById(R.id.debug_container)
         voiceStatus = findViewById(R.id.voice_status)
         voiceActionButton = findViewById(R.id.voice_action_button)
+        ttsVoiceSpinner = findViewById(R.id.tts_voice_spinner)
+        learningStatusButton = findViewById(R.id.learning_status_button)
+        learningStatusButtonMode = findViewById(R.id.learning_status_button_mode)
+        backHomeButton = findViewById(R.id.back_home_button)
         chatLog = findViewById(R.id.chat_log)
         chatLogScroll = findViewById(R.id.chat_log_scroll)
 
@@ -116,6 +131,43 @@ class MainActivity : AppCompatActivity() {
             setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         }
 
+        levelSpinner.adapter = android.widget.ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_item,
+            levelOptions
+        ).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+
+        val voiceAdapter = android.widget.ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_item,
+            TtsVoiceCatalog.voices
+        ).apply {
+            setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        }
+        ttsVoiceSpinner.adapter = voiceAdapter
+        val voicePrefs = getSharedPreferences(PipelinePrefs.NAME, MODE_PRIVATE)
+        val savedVoice = TtsVoiceCatalog.resolve(
+            voicePrefs.getString(PipelinePrefs.KEY_TTS_VOICE, null)
+        )
+        val savedIndex = TtsVoiceCatalog.voices.indexOf(savedVoice).coerceAtLeast(0)
+        ttsVoiceSpinner.setSelection(savedIndex)
+        voicePrefs.edit().putString(PipelinePrefs.KEY_TTS_VOICE, savedVoice).apply()
+        ttsVoiceSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?,
+                view: android.view.View?,
+                position: Int,
+                id: Long
+            ) {
+                val voice = TtsVoiceCatalog.voices.getOrNull(position) ?: TtsVoiceCatalog.defaultVoice
+                voicePrefs.edit().putString(PipelinePrefs.KEY_TTS_VOICE, voice).apply()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+
         findViewById<Button>(R.id.continue_button).setOnClickListener {
             val userId = userSpinner.selectedItem?.toString() ?: "-"
             val language = selectedLanguageOption()
@@ -127,19 +179,56 @@ class MainActivity : AppCompatActivity() {
             val userId = userSpinner.selectedItem?.toString() ?: "-"
             val language = selectedLanguageOption()
             val mode = modeSpinner.selectedItem?.toString() ?: "-"
+            val level = levelSpinner.selectedItem?.toString() ?: "Beginner"
             modeSpecificContext.text =
-                "User: $userId | Language: ${language.label} (${language.code}) | Mode: $mode"
+                "User: $userId | Language: ${language.label} (${language.code}) | Mode: $mode | Level: $level"
             showPanel(modeSpecificPanel)
-            sendTutorContext(userId, language, mode)
+            sendTutorContext(userId, language, mode, level)
+            if (!loadPreviousCheckbox.isChecked) {
+                val scope = com.mystuff.simpletutor.learning.LearnerScope(userId, language.code)
+                com.mystuff.simpletutor.learning.LearningRepository(this).clearTurns(scope)
+                chatLog.removeAllViews()
+            }
+            LearningScopeStore.save(
+                this,
+                LearningScopeInfo(
+                    userId = userId,
+                    languageCode = language.code,
+                    languageLabel = language.label,
+                    mode = mode,
+                    level = level
+                )
+            )
         }
 
         voiceActionButton.setOnClickListener {
+            if (currentPipelineState.equals("Thinking", ignoreCase = true) ||
+                currentPipelineState.equals("Speaking", ignoreCase = true)
+            ) {
+                val intent = Intent(this, MicrophoneForegroundService::class.java).apply {
+                    action = MicrophoneForegroundService.ACTION_INTERRUPT
+                }
+                ContextCompat.startForegroundService(this, intent)
+                return@setOnClickListener
+            }
             if (isAlwaysOn) return@setOnClickListener
             val intent = Intent(this, MicrophoneForegroundService::class.java).apply {
                 action = MicrophoneForegroundService.ACTION_SET_MANUAL_LISTEN
                 putExtra(MicrophoneForegroundService.EXTRA_ENABLED, !isListening)
             }
             ContextCompat.startForegroundService(this, intent)
+            setPipelineRoute("tutor")
+        }
+
+        learningStatusButton.setOnClickListener {
+            startActivity(Intent(this, LearningStatusActivity::class.java))
+        }
+        learningStatusButtonMode.setOnClickListener {
+            startActivity(Intent(this, LearningStatusActivity::class.java))
+        }
+
+        backHomeButton.setOnClickListener {
+            showPanel(userLanguagePanel)
         }
 
         findViewById<Button?>(R.id.debug_open_panel)?.setOnClickListener {
@@ -176,11 +265,11 @@ class MainActivity : AppCompatActivity() {
             filter,
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
+        setPipelineRoute(if (modeSpecificPanel.visibility == android.view.View.VISIBLE) "tutor" else "test_stt")
     }
 
     override fun onStop() {
         unregisterReceiver(pipelineReceiver)
-        setPipelineRoute("test_stt")
         super.onStop()
     }
 
@@ -204,7 +293,12 @@ class MainActivity : AppCompatActivity() {
         }
         voiceStatus.text = "Status: $displayState"
         voiceActionButton.isEnabled = !isAlwaysOn
-        voiceActionButton.text = if (isListening) "Stop listening" else "Start listening"
+        voiceActionButton.text = when {
+            currentPipelineState.equals("Thinking", ignoreCase = true) ||
+                currentPipelineState.equals("Speaking", ignoreCase = true) -> "Stop"
+            isListening -> "Stop listening"
+            else -> "Start listening"
+        }
         if (isAlwaysOn) {
             voiceActionButton.text = "Listening (always on)"
         }
@@ -228,13 +322,14 @@ class MainActivity : AppCompatActivity() {
         chatLogScroll.post { chatLogScroll.fullScroll(android.view.View.FOCUS_DOWN) }
     }
 
-    private fun sendTutorContext(userId: String, language: LanguageOption, mode: String) {
+    private fun sendTutorContext(userId: String, language: LanguageOption, mode: String, level: String) {
         val intent = Intent(this, MicrophoneForegroundService::class.java).apply {
             action = MicrophoneForegroundService.ACTION_SET_TUTOR_CONTEXT
             putExtra(MicrophoneForegroundService.EXTRA_USER_ID, userId)
             putExtra(MicrophoneForegroundService.EXTRA_LANG_LABEL, language.label)
             putExtra(MicrophoneForegroundService.EXTRA_LANG_CODE, language.code)
             putExtra(MicrophoneForegroundService.EXTRA_MODE, mode)
+            putExtra(MicrophoneForegroundService.EXTRA_LEVEL, level)
         }
         ContextCompat.startForegroundService(this, intent)
     }

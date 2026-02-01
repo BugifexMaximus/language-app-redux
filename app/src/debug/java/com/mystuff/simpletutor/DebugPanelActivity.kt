@@ -41,7 +41,6 @@ class DebugPanelActivity : AppCompatActivity() {
     private val llmModels = listOf("gpt-5.2", "gpt-5.2-2025-12-11")
     private val sttModels = listOf("gpt-4o-transcribe")
     private val ttsModels = listOf("tts-1", "tts-1-hd", "gpt-4o-mini-tts")
-    private val ttsVoices = listOf("alloy", "echo", "fable", "onyx", "nova", "shimmer")
     private val sttLanguages = listOf(
         "auto",
         "en", "es", "fr", "de", "it", "pt", "nl",
@@ -105,7 +104,7 @@ class DebugPanelActivity : AppCompatActivity() {
         voiceSpinner.adapter = ArrayAdapter(
             this,
             android.R.layout.simple_spinner_dropdown_item,
-            ttsVoices
+            TtsVoiceCatalog.voices
         )
 
 
